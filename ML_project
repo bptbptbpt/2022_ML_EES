@@ -1,0 +1,437 @@
+var no_forest = ee.FeatureCollection("users/vyordanov/workshops/deforestation/nonForestPolygons")
+var forest = ee.FeatureCollection("users/vyordanov/workshops/deforestation/forestPolygons")   
+var refPoints_2015 = ee.FeatureCollection("users/vyordanov/Amazon/Amazon2015_refPoints")
+var refPoints_2019 = ee.FeatureCollection("users/vyordanov/Amazon/Amazon2019_refPoints")  
+
+          
+//Definition of AOI
+var AOI = ee.Geometry.Polygon(
+        [[[-61, -14.6],
+        [-62.2, -14.6],
+        [-62.2, -15.8],
+        [-61, -15.8]]], null, false);
+        
+var AOI_train = ee.Geometry.Polygon(
+        [[[-54.1, -5.7],
+          [-51.8, -5.7],
+          [-51.8, -7.3],
+          [-54.1, -7.3]]], null, false);
+        
+Map.addLayer(AOI, {color:'red'}, "AOI",0);
+Map.centerObject(AOI,6);
+
+var aoiAREA = AOI.area({'maxError':1}).divide(1000000);
+print('AOI area: ', aoiAREA,'[km2]');
+
+//// FONCTIONS LANDSAT 8
+
+function applyScaleFactors(image) {
+  var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2);
+  var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0);
+  return image.addBands(opticalBands, null, true)
+    .addBands(thermalBands, null, true);
+}
+
+var visParLandsat = {
+  bands: ['SR_B4', 'SR_B3', 'SR_B2'],
+  min: 0.0,
+  max: 0.3,
+};
+
+function ndviLS(image){
+  var ndvi = image.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+  return image.addBands(ndvi);
+}
+
+//// FONCTIONS SENTINEL 2
+//function to mask the clouds on Sentinel-2 images
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+
+function ndviSE(image){
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  return image.addBands(ndvi);
+}
+
+var visParSentinel = {
+  min: 0.0,
+  max: 0.3,
+  bands: ['B4', 'B3', 'B2'],
+};
+
+///// TELECHARGEMENT IMAGES 
+
+var landsat_train2015 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+                    .filterDate('2015-05-01', '2015-09-30')
+                    .filterBounds(AOI_train)
+                    .filter(ee.Filter.lt('CLOUD_COVER', 5))
+                    .aside(print)
+                    .map(applyScaleFactors)
+                    .map(ndviLS)
+                    .median()
+                    .clip(AOI_train);
+                    
+                    
+var landsat2016 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+                    .filterDate('2016-05-01', '2016-09-30')
+                    .filterBounds(AOI)
+                    .filter(ee.Filter.lt('CLOUD_COVER', 5))
+                    .aside(print)
+                    .map(applyScaleFactors)
+                    .map(ndviLS)
+                    .median()
+                    .clip(AOI);
+                    
+var sentinel_train2019 = ee.ImageCollection('COPERNICUS/S2_SR')
+                  .filterDate('2019-05-01','2019-09-30')
+                  .filterBounds(AOI_train)
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 5))
+                  .aside(print)
+                  .map(maskS2clouds)
+                  .map(ndviSE)
+                  .median()
+                  .clip(AOI_train);
+
+                  
+var sentinel2021 = ee.ImageCollection('COPERNICUS/S2_SR')
+                  .filterDate('2021-05-01','2021-09-30')
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 5))
+                  .aside(print)
+                  .map(maskS2clouds)
+                  .map(ndviSE)
+                  .median()
+                  .clip(AOI);
+                  
+
+//// AFFICHAGE LAYERS
+
+Map.addLayer(landsat2016,visParLandsat,'Landsat 2016',0);
+Map.addLayer(landsat2016.select('NDVI'),{min: -1, max: 1, palette: ['blue', 'white', 'green']},'NDVI2016',0);
+
+Map.addLayer(sentinel2021, visParSentinel, 'Sentinel 2021',0);
+Map.addLayer(sentinel2021.select('NDVI'),{min: -1, max: 1, palette: ['blue', 'white', 'green']}, 'NDVI2021',0);
+
+//// EXPORT IMAGES
+
+Export.image.toDrive({
+  image: landsat2016,
+  description: '2016',
+  region: AOI,
+  scale: 100,
+  crs: 'EPSG:32721',
+  fileFormat: 'GeoTIFF',
+  folder: 'GEE_ML',
+  maxPixels: 1e10
+});
+
+Export.image.toDrive({
+  image: sentinel2021,
+  description: '2021',
+  region: AOI,
+  scale: 100,
+  crs: 'EPSG:32721',
+  fileFormat: 'GeoTIFF',
+  folder: 'GEE_ML',
+  maxPixels: 1e10
+});
+
+//// CLASSIFICATION
+
+// Define the spectral bands that will be used during the classification,
+// Red (SR_B4), Green (SR_B3), Blue (SR_B2), Near-Infrared (SR_B5) and NDVI:
+var bandsLandsat = ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'NDVI'];
+// Sample the created regions from the Landsat image:
+var sampledNonForestLandsat = landsat_train2015.select(bandsLandsat).sampleRegions({
+ collection: no_forest, 
+ properties: ['landcover'], 
+ scale: 30 // resolution of the image 
+});
+
+// Split into train set containing 80% of the sampled points and test set containing 20% of the sampled points:
+var threshold=0.8;
+var trainNonForestLandsat = sampledNonForestLandsat.randomColumn('random').filter(ee.Filter.lte('random',threshold));
+var testNonForestLandsat = sampledNonForestLandsat.randomColumn('random').filter(ee.Filter.gt('random', threshold));
+
+// Sample the created regions from the Landsat image:
+var sampledForestLandsat = landsat_train2015.select(bandsLandsat).sampleRegions({
+ collection: forest, // The regions to sample over
+ properties: ['landcover'], //The list of properties to copy from each input feature
+ scale: 30 // resolution of the image (in this case Landsat)
+});
+// Split the sampled points into train set containing 80% of the sampled points
+// and test set containing 20% of the sampled points:
+var threshold=0.8;
+var trainForestLandsat = sampledForestLandsat.randomColumn('random').filter(ee.Filter.lte('random',threshold));
+var testForestLandsat = sampledForestLandsat.randomColumn('random').filter(ee.Filter.gt('random', threshold));
+// Merge both feature collections in one:
+var trainLandsat = trainForestLandsat.merge(trainNonForestLandsat);
+var testLandsat = testForestLandsat.merge(testNonForestLandsat);
+
+// Train the RandomForest classifier with the train dataset,
+// assigning the desired number of trees, specifying the class property
+// and the input properties:
+var classifier2015 = ee.Classifier.smileRandomForest(10).train({
+ features: trainLandsat,
+ classProperty: 'landcover',
+ inputProperties: bandsLandsat
+});
+// Get a confusion matrix and compute the accuracy of the model performance:
+print('Landsat RF error matrix: ', classifier2015.confusionMatrix());
+print('Landsat RF accuracy: ', classifier2015.confusionMatrix().accuracy());
+print("Landsat RF Cohen's Kappa:", classifier2015.confusionMatrix().kappa());
+
+// Apply the classifier to the Landsat image:
+var classified2016 = landsat2016.select(bandsLandsat).classify(classifier2015);
+// Classify the test sample, get a confusion matrix and compute the accuracy of the
+// model test performance:
+var testingLandsat = testLandsat.classify(classifier2015);
+var testAccuracyLandsat = testingLandsat.errorMatrix('landcover', 'classification');
+print('Landsat Validation error matrix: ', testAccuracyLandsat);
+print('Landsat Validation overall accuracy: ', testAccuracyLandsat.accuracy());
+print("Landsat Validation Cohen's Kappa:", testAccuracyLandsat.kappa());
+
+
+// Load, classify the External dataset, get a confusion matrix and compute the accuracy of the model test performance:
+
+Map.addLayer(refPoints_2015.filter(ee.Filter.eq('land_cover',0)).draw('red'),{},'External Validation Points NF 2015',0);
+Map.addLayer(refPoints_2015.filter(ee.Filter.eq('land_cover',1)).draw('green'),{},'External Validation Points F 2015',0);
+
+//classify the External dataset, get a confusion matrix and compute the accuracy of the model test performance:
+refPoints_2015 = refPoints_2015.map(function(feat){
+ return ee.Feature(feat.geometry(), {
+ landcover: feat.get('land_cover'),
+ });
+});
+var sampleRefPointsLandsat = classified2016.select('classification').sampleRegions({
+ collection: refPoints_2015,
+ properties: ['landcover'],
+ scale: 30
+});
+print(sampleRefPointsLandsat);
+var refAccuracyLandsat = sampleRefPointsLandsat.errorMatrix('landcover', 'classification');
+print('Landsat External Validation error matrix: ', refAccuracyLandsat);
+print('Landsat External Validation overall accuracy: ', refAccuracyLandsat.accuracy());
+print("Landsat External Validation Cohen's Kappa:", refAccuracyLandsat.kappa());
+
+
+// Define a color palette for the classification map
+var palette = [
+ 'red', // non-forest
+ 'green', // forest
+];
+// Add the classified maps
+Map.addLayer(classified2016, {min: 0, max: 1, palette: palette}, 'Forest Classification 2016',0);
+
+
+///////////////////// CLASSIFY SENTINEL 2
+
+// Classify Sentinel-2
+// Define the spectral bands that will be used during the classification,
+// Red (B4), Green (B3), Blue (B2) and Near-Infrared (B8):
+var bandSentinel = ['B2', 'B3', 'B4', 'B8','NDVI'];
+// Sample the created regions from the Landsat image:
+var sampledNonForestSentinel= sentinel_train2019.select(bandSentinel).sampleRegions({
+ collection: no_forest,
+ properties: ['landcover'],
+ scale: 10
+});
+// Split into train set containing 80% of the sampled points
+// and test set containing 20% of the sampled points:
+var threshold=0.8;
+var trainNonForestSentinel = sampledNonForestSentinel.randomColumn('random').filter(ee.Filter.lte('random',threshold));
+var testNonForestSentinel = sampledNonForestSentinel.randomColumn('random').filter(ee.Filter.gt('random', threshold)); //
+// Sample the created regions from the Landsat image:
+var sampledForestSentinel= sentinel_train2019.select(bandSentinel).sampleRegions({
+ collection: forest,
+ properties: ['landcover'],
+ scale: 10
+});
+// Split the sampled points into train set containing 80% of the sampled points
+// and test set containing 20% of the sampled points:
+var threshold=0.8;
+var trainForestSentinel = sampledForestSentinel.randomColumn('random').filter(ee.Filter.lte('random',threshold));
+var testForestSentinel = sampledForestSentinel.randomColumn('random').filter(ee.Filter.gt('random', threshold));
+// Merge both feature collections in one:
+var trainSentinel = trainForestSentinel.merge(trainNonForestSentinel);
+var testSentinel = testForestSentinel.merge(testNonForestSentinel);
+// Train the RandomForest classifier with the train dataset,
+// assigning the desired number of trees, specifying the class property
+// and the input properties:
+var classifierSentinel = ee.Classifier.smileRandomForest(10).train({
+ features: trainSentinel,
+ classProperty: 'landcover',
+ inputProperties: bandSentinel
+});
+
+print('Sentinel RF error matrix: ', classifierSentinel.confusionMatrix());
+print('Sentinel RF accuracy: ', classifierSentinel.confusionMatrix().accuracy());
+print("Sentinel RF Cohen's Kappa:", classifierSentinel.confusionMatrix().kappa());
+// Apply the classifier to the Landsat image:
+//var classified2019 = sentinel2019.select(bandSentinel).classify(classifierSentinel);
+var classified2021 = sentinel2021.select(bandSentinel).classify(classifierSentinel);
+
+// Classify the test sample, get a confusion matrix and compute the accuracy of the model test performance:
+var testingSentinel = testSentinel.classify(classifierSentinel);
+var testAccuracySentinel = testingSentinel.errorMatrix('landcover', 'classification');
+print('Sentinel Validation error matrix: ', testAccuracySentinel);
+print('Sentinel Validation overall accuracy: ', testAccuracySentinel.accuracy());
+print("Sentinel Validation Cohen's Kappa:", testAccuracySentinel.kappa());
+// Classify the External dataset, get a confusion matrix and compute the accuracy of the model test
+//performance:
+
+refPoints_2019 = refPoints_2019.map(function(feat){
+ return ee.Feature(feat.geometry(), {
+ landcover: feat.get('land_cover'),
+ })
+})
+var sampleRefPointsSentinel = classified2021.select('classification').sampleRegions({
+ collection: refPoints_2019,
+ properties: ['landcover'],
+ scale: 10
+});
+
+//print(sampleRefPointsSentinel)
+var refAccuracySentinel = sampleRefPointsSentinel.errorMatrix('landcover', 'classification');
+print('Sentinel External Validation error matrix 19: ', refAccuracySentinel);
+print('Sentinel External Validation overall accuracy 19: ', refAccuracySentinel.accuracy());
+print("Sentinel External Validation Cohen's Kappa 19:", refAccuracySentinel.kappa());
+
+// Add the classified maps
+
+Map.addLayer(classified2021, {min: 0, max: 1, palette: palette}, 'Forest Classification 2021',0);
+
+
+////////////// CLEANING
+
+var classified2016clean = classified2016.focalMode(2)
+Map.addLayer(classified2016clean, {min: 0, max: 1, palette: palette}, 'Forest Classification 2016 Cleaned',0);
+
+var classified2021clean = classified2021.focalMode(2)
+Map.addLayer(classified2021clean, {min: 0, max: 1, palette: palette}, 'Forest Classification 2021 Cleaned',0);
+
+//Reprojection
+var classified2016_10m = classified2016clean.reproject({
+  'crs': 'EPSG:32721',
+  'scale': 100})
+print('Forest Classification 2016 10m scale:', classified2016_10m.projection().nominalScale());
+
+
+var classified2021_10m = classified2021clean.reproject({
+  'crs': 'EPSG:32721',
+  'scale': 100})
+print('Forest Classification 2021 10m scale:', classified2021_10m.projection().nominalScale());
+
+
+// Export
+
+Export.image.toDrive({
+ image: classified2016_10m,
+ description: 'classified2016',
+ folder: 'GEE',
+ scale: 30,
+ crs: 'EPSG:32721',
+ region: AOI,
+ maxPixels: 1e11
+})
+
+Export.image.toDrive({
+ image: classified2021_10m,
+ description: 'classified2021',
+ folder: 'GEE',
+ scale: 30,
+ crs: 'EPSG:32721',
+ region: AOI,
+ maxPixels: 1e11
+})
+
+
+Map.addLayer(classified2016_10m,{min: 0, max: 1, palette: palette},'Forest Classification 2016 10m',0)
+Map.addLayer(classified2021_10m,{min: 0, max: 1, palette: palette},'Forest Classification 2021 10m',0)
+
+
+// Compute the difference between the two classification maps and add it as a new layer:
+
+var diff16_21=classified2016_10m.subtract(classified2021_10m);
+Map.addLayer(diff16_21,{min:-1,mean:0,max:1, palette:['0000FF','00FF00','FF0000']},'2016-2021 Difference',0);
+
+/* 1 Forest - 0 NonForest = 1 Loss // 0 NonForest - 1 Forest = -1 Gain */
+// Add as a layer just the areas that are representing the forest loss:
+
+var forest_loss16_21=diff16_21.updateMask(diff16_21.eq(1));
+Map.addLayer(forest_loss16_21,{palette:'FF0000'}, 'Forest Loss 2016-2021',0);
+
+// Add as a layer just the areas that are representing the forest gain:
+
+var forest_gain16_21=diff16_21.updateMask(diff16_21.eq(-1));
+Map.addLayer(forest_gain16_21,{palette:'00FF00'}, 'Forest Gain 2016-2021',0);
+
+Export.image.toDrive({
+ image: diff16_21,
+ description: 'diff16_21',
+ folder: 'GEE',
+ scale: 30,
+ crs: 'EPSG:32721',
+ region: AOI,
+ maxPixels: 1e11
+})
+
+///////////// STATS
+
+print('AOI Area: ',aoiAREA,"[km²]")
+
+// Compute and print the area of the forest loss and forest gain:
+var areaLoss16_21 = forest_loss16_21.multiply(ee.Image.pixelArea().divide(1000000));
+var statsLoss16_21 = areaLoss16_21.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: AOI,
+  scale: 100,
+  maxPixels: 1e11,
+  tileScale:16
+}).getNumber('classification');
+
+print('Forest 2016:', classified2016_10m.multiply(ee.Image.pixelArea().divide(1000000)).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: AOI,
+  scale: 100,
+  maxPixels: 1e11,
+  tileScale:16
+}).getNumber('classification'),"[km²]")
+
+
+print('Forest 2021:', classified2021_10m.multiply(ee.Image.pixelArea().divide(1000000)).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: AOI,
+  scale: 100,
+  maxPixels: 1e11,
+  tileScale:16
+}).getNumber('classification'),"[km²]")
+
+
+print('Forest Loss 2016-2021:', statsLoss16_21,"[km²]");
+
+var areaGain16_21 = forest_gain16_21.multiply(ee.Image.pixelArea().divide(-1000000));
+var statsGain16_21 = areaGain16_21.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: AOI,
+  scale: 100,
+  maxPixels: 1e11,
+  tileScale:16
+}).getNumber('classification');
+
+print('Forest Gain 2016-2021:', statsGain16_21,"[km²]");
+
+// Compute and print the relative area of the forest loss and forest gain
+// in relation to the total area of the AOI:
+var relLoss16_21=statsLoss16_21.divide(aoiAREA);
+print("Relative Loss 16_21: ",relLoss16_21.multiply(100),"%");
+var relGain16_21=statsGain16_21.divide(aoiAREA);
+print("Relative Gain 16_21: ",relGain16_21.multiply(100),"%");
